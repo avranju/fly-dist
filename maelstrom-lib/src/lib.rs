@@ -3,6 +3,7 @@ use std::{
 };
 
 use async_trait::async_trait;
+use futures::future::join_all;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use thiserror::Error;
 use tokio::io::{self, AsyncBufReadExt, BufReader};
@@ -62,7 +63,10 @@ where
 }
 
 #[async_trait]
-pub trait MessageHandler<Body: Serialize + DeserializeOwned + Send + Clone> {
+pub trait MessageHandler<Body>
+where
+    Body: Serialize + DeserializeOwned + Send + Clone,
+{
     async fn handle(&self, ctx: Context<Body>, msg: Message<Body>) -> Result<(), Error>;
 }
 
@@ -128,11 +132,14 @@ where
 
         while let Some(line) = lines.next_line().await? {
             let msg: Message<B> = serde_json::from_str(&line)?;
-            let handlers = self.handlers.borrow();
 
-            let f = handlers
-                .iter()
-                .map(|(_, h)| h.handle(ctx.clone(), msg.clone()));
+            let _ = join_all(
+                self.handlers
+                    .borrow()
+                    .iter()
+                    .map(|(_, h)| h.handle(ctx.clone(), msg.clone())),
+            )
+            .await;
         }
 
         Ok(())
