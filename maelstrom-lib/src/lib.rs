@@ -22,6 +22,9 @@ pub enum Error {
     #[error("Reply channel send error")]
     ReplySendError(#[from] mpsc::error::SendError<(Message, String, Option<JsonValue>)>),
 
+    #[error("Parse error")]
+    Parse(String),
+
     #[error("Unknown error")]
     Unknown,
 }
@@ -63,11 +66,16 @@ pub struct Message {
 
 #[derive(Clone)]
 pub struct Context {
+    node_id: String,
     node: Node,
     reply_queue_tx: mpsc::Sender<(Message, String, Option<JsonValue>)>,
 }
 
 impl Context {
+    pub fn node_id(&self) -> &str {
+        &self.node_id
+    }
+
     pub async fn reply_to(&self, src: Message, type_: String) -> Result<(), Error> {
         Ok(self.reply_queue_tx.send((src, type_, None)).await?)
     }
@@ -114,7 +122,7 @@ where
     }
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Init {
     node_id: String,
     node_ids: Vec<String>,
@@ -122,7 +130,7 @@ pub struct Init {
 
 async fn handle_init(ctx: Context, msg: Message) -> Result<(), Error> {
     if let Some(init) = msg.body.parse::<Init>()? {
-        trace!("Received init message for node {}.", init.node_id);
+        trace!("Received init message for node {:?}.", init);
 
         let mut state = ctx.node.state.lock().await;
         state.id = init.node_id;
@@ -226,31 +234,42 @@ impl Node {
         let stdin = io::stdin();
         let reader = BufReader::new(stdin);
         let mut lines = reader.lines();
-        let ctx = Context {
-            node: self.clone(),
-            reply_queue_tx: self.state.lock().await.reply_queue_tx.clone(),
+        let (reply_queue_tx, mut reply_queue_rx) = {
+            let mut state = self.state.lock().await;
+            (
+                state.reply_queue_tx.clone(),
+                state
+                    .reply_queue_rx
+                    .take()
+                    .expect("Reply queue receiver must have been set"),
+            )
         };
-        let id = self.id().await;
-        let mut reply_queue_rx = {
-            self.state
-                .lock()
-                .await
-                .reply_queue_rx
-                .take()
-                .expect("Reply queue receiver must have been set")
+
+        let mut ctx = Context {
+            node_id: String::new(),
+            node: self.clone(),
+            reply_queue_tx,
         };
 
         loop {
             tokio::select! {
                 Some((msg, type_, body)) = reply_queue_rx.recv() => {
+                    // if the "type_" is "init_ok" then we have a valid node ID
+                    // now; store it in the ctx
+                    if type_ == "init_ok" {
+                        ctx.node_id = self.state.lock().await.id.clone();
+                    }
+
                     self.reply_to(msg, type_, body).await?;
                 },
 
                 Ok(Some(line)) = lines.next_line() => {
-                    trace!("[{}] Received: {}", id, line);
+                    trace!("[{}] Received: {}", ctx.node_id, line);
                     let msg: Message = serde_json::from_str(&line)?;
                     if let Some(handlers) = self.handlers.lock().await.get(&msg.body.type_) {
+                        trace!("[{}] Dispatching message: {}", ctx.node_id, line);
                         let _ = join_all(handlers.iter().map(|h| h.handle(ctx.clone(), msg.clone()))).await;
+                        trace!("[{}] Dispatch complete: {}", ctx.node_id, line);
                     }
                 },
             }

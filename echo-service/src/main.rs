@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::init();
+    let mut builder = env_logger::Builder::from_default_env();
+    builder.target(env_logger::Target::Stderr).init();
 
     let mut node = Node::new().await;
     node.handle("echo", handle_echo).await;
