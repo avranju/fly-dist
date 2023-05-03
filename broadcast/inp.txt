@@ -1,0 +1,6 @@
+{"id":0,"src":"c1","dest":"n1","body":{"type":"init","node_id":"n1","node_ids":["n0","n1","n2"],"msg_id":1}}
+{"id":10,"src":"c6","dest":"n1","body":{"message":1000,"type":"broadcast","msg_id":2}}
+{"id":11,"src":"c6","dest":"n1","body":{"message":1001,"type":"broadcast","msg_id":3}}
+{"id":12,"src":"c6","dest":"n1","body":{"message":1002,"type":"broadcast","msg_id":4}}
+{"id":13,"src":"c6","dest":"n1","body":{"message":1003,"type":"broadcast","msg_id":5}}
+{"id":14,"src":"c6","dest":"n1","body":{"type":"read","msg_id":6}}

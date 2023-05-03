@@ -14,6 +14,7 @@ const CUSTOM_EPOCH: i64 = 1420070400000;
 const NODE_ID_BITS: u64 = 10;
 const SEQUENCE_BITS: u64 = 12;
 
+#[derive(Debug)]
 struct State {
     last_timestamp: i64,
     sequence: u64,
@@ -101,9 +102,7 @@ async fn handle_generate(ctx: Context, msg: Message) -> Result<(), Error> {
     };
 
     ctx.reply_to_with(msg, "generate_ok".to_string(), Some(id))
-        .await?;
-
-    Ok(())
+        .await
 }
 
 fn wait_next_ms(mut current_timestamp: i64, last_timestamp: i64) -> i64 {

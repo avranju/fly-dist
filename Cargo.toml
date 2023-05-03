@@ -3,4 +3,5 @@ members = [
   "maelstrom-lib",
   "echo",
   "uniqueid",
+  "broadcast",
 ]
