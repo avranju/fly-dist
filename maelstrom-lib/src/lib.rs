@@ -264,12 +264,9 @@ impl Node {
                 },
 
                 Ok(Some(line)) = lines.next_line() => {
-                    trace!("[{}] Received: {}", ctx.node_id, line);
                     let msg: Message = serde_json::from_str(&line)?;
                     if let Some(handlers) = self.handlers.lock().await.get(&msg.body.type_) {
-                        trace!("[{}] Dispatching message: {}", ctx.node_id, line);
                         let _ = join_all(handlers.iter().map(|h| h.handle(ctx.clone(), msg.clone()))).await;
-                        trace!("[{}] Dispatch complete: {}", ctx.node_id, line);
                     }
                 },
             }
