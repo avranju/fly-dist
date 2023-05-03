@@ -1,6 +1,6 @@
 [workspace]
 members = [
   "maelstrom-lib",
-  "echo-service",
-  "uniqueid-service",
+  "echo",
+  "uniqueid",
 ]
