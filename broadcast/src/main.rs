@@ -1,4 +1,4 @@
-use std::sync::Mutex;
+use std::{collections::HashMap, sync::Mutex};
 
 use anyhow::Result;
 use log::trace;
@@ -30,7 +30,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 struct Broadcast {
     message: i64,
 }
@@ -49,8 +49,8 @@ async fn handle_broadcast(ctx: Context, msg: Message) -> Result<(), Error> {
     Ok(())
 }
 
-#[derive(Serialize, Deserialize)]
-struct Read {
+#[derive(Debug, Serialize, Deserialize)]
+struct ReadResponse {
     messages: Vec<i64>,
 }
 
@@ -58,12 +58,19 @@ async fn handle_read(ctx: Context, msg: Message) -> Result<(), Error> {
     trace!("Received read");
 
     let messages = { state().lock().unwrap().messages.clone() };
-    ctx.reply_to_with(msg, "read_ok".to_string(), Some(Read { messages }))
+    ctx.reply_to_with(msg, "read_ok".to_string(), Some(ReadResponse { messages }))
         .await
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct Topology {
+    topology: HashMap<String, Vec<String>>,
+}
+
 async fn handle_topology(ctx: Context, msg: Message) -> Result<(), Error> {
-    trace!("Received topology");
+    if let Some(topology) = msg.body.parse::<Topology>()? {
+        trace!("Received topology: {topology:?}");
+    }
 
     ctx.reply_to(msg, "topology_ok".to_string()).await
 }
