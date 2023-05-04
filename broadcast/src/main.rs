@@ -51,7 +51,7 @@ async fn handle_broadcast(ctx: Context, msg: Message) -> Result<(), Error> {
 
             // if this message hasn't been seen before then we add it to our
             // vec and forward it along to our neighbours
-            state.messages.contains(&broadcast.message).then(|| {
+            (!state.messages.contains(&broadcast.message)).then(|| {
                 state.messages.push(broadcast.message);
 
                 // send this message to all of our neighbours
