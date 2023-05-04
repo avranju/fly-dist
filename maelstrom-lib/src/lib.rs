@@ -25,6 +25,9 @@ pub enum Error {
     #[error("Parse error")]
     Parse(String),
 
+    #[error("Message was expected to have a message ID but not found.")]
+    MissingMessageId,
+
     #[error("Unknown error")]
     Unknown,
 }
@@ -41,7 +44,7 @@ pub struct Reply<B> {
 pub struct Body {
     #[serde(rename = "type")]
     pub type_: String,
-    pub msg_id: u64,
+    pub msg_id: Option<u64>,
 
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub body: Option<JsonValue>,
@@ -94,6 +97,21 @@ impl Context {
                 body.map(|b| serde_json::to_value(b)).transpose()?,
             ))
             .await?)
+    }
+
+    pub async fn send<R: Serialize>(
+        &self,
+        node_id: String,
+        type_: String,
+        body: Option<R>,
+    ) -> Result<(), Error> {
+        self.node
+            .send(
+                node_id,
+                type_,
+                body.map(|b| serde_json::to_value(&b)).transpose()?,
+            )
+            .await
     }
 }
 
@@ -198,6 +216,27 @@ impl Node {
         }
     }
 
+    pub async fn send(
+        &self,
+        node_id: String,
+        type_: String,
+        body: Option<JsonValue>,
+    ) -> Result<(), Error> {
+        let msg = Message {
+            src: self.id().await,
+            dest: node_id,
+            body: Body {
+                msg_id: None,
+                type_,
+                body,
+            },
+        };
+
+        println!("{}", serde_json::to_string(&msg)?);
+
+        Ok(())
+    }
+
     pub async fn reply_to(
         &self,
         src: Message,
@@ -210,7 +249,7 @@ impl Node {
         state.msg_id_counter += 1;
 
         let reply = Reply {
-            in_reply_to: src.body.msg_id,
+            in_reply_to: src.body.msg_id.ok_or(Error::MissingMessageId)?,
             body,
         };
 
@@ -218,7 +257,7 @@ impl Node {
             src: state.id.clone(),
             dest: src.src,
             body: Body {
-                msg_id,
+                msg_id: Some(msg_id),
                 type_,
                 body: Some(serde_json::to_value(reply)?),
             },
