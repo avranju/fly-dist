@@ -14,7 +14,7 @@ use tokio::{sync::watch, time::sleep};
 
 // Duration we wait for an ack for a message store request before
 // retrying the request.
-const SEND_TIMEOUT_MS: u64 = 800;
+const SEND_TIMEOUT_MS: u64 = 2000;
 
 #[derive(Debug)]
 struct SendState {
@@ -102,6 +102,10 @@ async fn handle_message(type_: &'static str, ctx: Context, msg: Message) -> Resu
                 st.send_queue.extend(
                     neighbours
                         .iter()
+                        .filter(|node_id| {
+                            // don't send the message back to the node that sent it to us
+                            **node_id != msg.src
+                        })
                         .map(|node_id| SendState::new(now, node_id.clone(), broadcast.message)),
                 );
 
@@ -111,6 +115,10 @@ async fn handle_message(type_: &'static str, ctx: Context, msg: Message) -> Resu
                 // send this message to all of our neighbours
                 neighbours
                     .into_iter()
+                    .filter(|node_id| {
+                        // don't send the message back to the node that sent it to us
+                        *node_id != msg.src
+                    })
                     .map(|node_id| ctx.send(node_id, "store".to_string(), Some(broadcast.clone())))
             })
         };
