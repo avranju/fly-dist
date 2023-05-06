@@ -72,6 +72,10 @@ pub struct Context {
 }
 
 impl Context {
+    pub fn node(&self) -> &Node {
+        &self.node
+    }
+
     pub fn node_id(&self) -> &str {
         &self.node_id
     }

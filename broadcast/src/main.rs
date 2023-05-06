@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -35,7 +35,7 @@ impl SendState {
 
 #[derive(Debug)]
 struct State {
-    messages: Vec<i64>,
+    messages: HashSet<i64>,
     neighbours: Vec<String>,    // node ids of neighbours
     send_queue: Vec<SendState>, // message sends that need to be tracked for delivery
     send_watch_tx: watch::Sender<()>,
@@ -49,7 +49,7 @@ fn state() -> &'static Mutex<State> {
 
     INSTANCE.get_or_init(|| {
         Mutex::new(State {
-            messages: vec![],
+            messages: HashSet::new(),
             neighbours: vec![],
             send_queue: vec![],
             send_watch_tx,
@@ -81,64 +81,6 @@ async fn main() -> Result<()> {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Broadcast {
     message: i64,
-}
-
-async fn handle_message(type_: &'static str, ctx: Context, msg: Message) -> Result<(), Error> {
-    if let Some(broadcast) = msg.body.parse::<Broadcast>()? {
-        trace!("Received {}: {}", type_, broadcast.message);
-
-        let f = {
-            let mut st = state().lock().unwrap();
-
-            // if this message hasn't been seen before then we add it to our
-            // vec and forward it along to our neighbours
-            (!st.messages.contains(&broadcast.message)).then(|| {
-                st.messages.push(broadcast.message);
-
-                // add all the broadcasts to the send queue so we can track
-                // its receipt and retry send if necessary
-                let neighbours = st.neighbours.clone();
-                let now = Instant::now();
-                st.send_queue.extend(
-                    neighbours
-                        .iter()
-                        .filter(|node_id| {
-                            // don't send the message back to the node that sent it to us
-                            **node_id != msg.src
-                        })
-                        .map(|node_id| SendState::new(now, node_id.clone(), broadcast.message)),
-                );
-
-                // schedule a scan of pending sends SEND_TIMEOUT_MS in the future
-                schedule_send_scan();
-
-                // send this message to all of our neighbours
-                neighbours
-                    .into_iter()
-                    .filter(|node_id| {
-                        // don't send the message back to the node that sent it to us
-                        *node_id != msg.src
-                    })
-                    .map(|node_id| ctx.send(node_id, "store".to_string(), Some(broadcast.clone())))
-            })
-        };
-
-        if let Some(f) = f {
-            // send the message to our neighbours
-            let _ = join_all(f).await;
-        }
-
-        match type_ {
-            "broadcast" => ctx.reply_to(msg, "broadcast_ok".to_string()).await?,
-            "store" => {
-                ctx.reply_to_with(msg, "store_ok".to_string(), Some(broadcast))
-                    .await?
-            }
-            _ => (),
-        }
-    }
-
-    Ok(())
 }
 
 async fn send_scan(node: Node) {
@@ -204,11 +146,73 @@ fn schedule_send_scan() {
 }
 
 async fn handle_broadcast(ctx: Context, msg: Message) -> Result<(), Error> {
-    handle_message("broadcast", ctx, msg).await
+    if let Some(broadcast) = msg.body.parse::<Broadcast>()? {
+        trace!("Received broadcast: {}", broadcast.message);
+
+        // we treat all other nodes as our direct neighbour
+        let mut neighbours = ctx.node().node_ids().await;
+        neighbours.retain(|nid| nid != ctx.node_id());
+
+        let f = {
+            let mut st = state().lock().unwrap();
+
+            // if this message hasn't been seen before then we add it to our
+            // vec and forward it along to our neighbours
+            st.messages.insert(broadcast.message).then(|| {
+                // add all the broadcasts to the send queue so we can track
+                // its receipt and retry send if necessary
+                let now = Instant::now();
+                st.send_queue.extend(
+                    neighbours
+                        .iter()
+                        .filter(|node_id| {
+                            // don't send the message back to the node that sent it to us
+                            **node_id != msg.src
+                        })
+                        .map(|node_id| SendState::new(now, node_id.clone(), broadcast.message)),
+                );
+
+                // schedule a scan of pending sends SEND_TIMEOUT_MS in the future
+                schedule_send_scan();
+
+                // send this message to all of our neighbours
+                neighbours
+                    .into_iter()
+                    .filter(|node_id| {
+                        // don't send the message back to the node that sent it to us
+                        *node_id != msg.src
+                    })
+                    .map(|node_id| ctx.send(node_id, "store".to_string(), Some(broadcast.clone())))
+            })
+        };
+
+        if let Some(f) = f {
+            // send the message to our neighbours
+            let _ = join_all(f).await;
+        }
+
+        ctx.reply_to(msg, "broadcast_ok".to_string()).await?;
+    }
+
+    Ok(())
 }
 
 async fn handle_store(ctx: Context, msg: Message) -> Result<(), Error> {
-    handle_message("store", ctx, msg).await
+    if let Some(broadcast) = msg.body.parse::<Broadcast>()? {
+        trace!("Received store: {}", broadcast.message);
+
+        {
+            let mut st = state().lock().unwrap();
+
+            // if this message hasn't been seen before then we add it to our
+            // vec and forward it along to our neighbours
+            st.messages.insert(broadcast.message);
+        }
+        ctx.reply_to_with(msg, "store_ok".to_string(), Some(broadcast))
+            .await?;
+    }
+
+    Ok(())
 }
 
 async fn handle_store_ok(_ctx: Context, msg: Message) -> Result<(), Error> {
@@ -236,7 +240,7 @@ async fn handle_store_ok(_ctx: Context, msg: Message) -> Result<(), Error> {
 
 #[derive(Debug, Serialize, Deserialize)]
 struct ReadResponse {
-    messages: Vec<i64>,
+    messages: HashSet<i64>,
 }
 
 async fn handle_read(ctx: Context, msg: Message) -> Result<(), Error> {
