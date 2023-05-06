@@ -25,9 +25,6 @@ pub enum Error {
     #[error("Parse error")]
     Parse(String),
 
-    #[error("Message was expected to have a message ID but not found.")]
-    MissingMessageId,
-
     #[error("Unknown error")]
     Unknown,
 }
@@ -44,7 +41,7 @@ pub struct Reply<B> {
 pub struct Body {
     #[serde(rename = "type")]
     pub type_: String,
-    pub msg_id: Option<u64>,
+    pub msg_id: u64,
 
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub body: Option<JsonValue>,
@@ -105,13 +102,7 @@ impl Context {
         type_: String,
         body: Option<R>,
     ) -> Result<(), Error> {
-        self.node
-            .send(
-                node_id,
-                type_,
-                body.map(|b| serde_json::to_value(&b)).transpose()?,
-            )
-            .await
+        self.node.send_value(node_id, type_, body).await
     }
 }
 
@@ -216,17 +207,42 @@ impl Node {
         }
     }
 
+    async fn next_msg_id(&self) -> u64 {
+        let mut state = self.state.lock().await;
+
+        let msg_id = state.msg_id_counter as u64;
+        state.msg_id_counter += 1;
+
+        msg_id
+    }
+
+    pub async fn send_value<R: Serialize>(
+        &self,
+        node_id: String,
+        type_: String,
+        body: Option<R>,
+    ) -> Result<(), Error> {
+        self.send(
+            node_id,
+            type_,
+            body.map(|b| serde_json::to_value(&b)).transpose()?,
+        )
+        .await
+    }
+
     pub async fn send(
         &self,
         node_id: String,
         type_: String,
         body: Option<JsonValue>,
     ) -> Result<(), Error> {
+        let (src, msg_id) = tokio::join!(self.id(), self.next_msg_id());
+
         let msg = Message {
-            src: self.id().await,
+            src,
             dest: node_id,
             body: Body {
-                msg_id: None,
+                msg_id,
                 type_,
                 body,
             },
@@ -243,21 +259,18 @@ impl Node {
         type_: String,
         body: Option<JsonValue>,
     ) -> Result<(), Error> {
-        let mut state = self.state.lock().await;
-
-        let msg_id = state.msg_id_counter as u64;
-        state.msg_id_counter += 1;
-
         let reply = Reply {
-            in_reply_to: src.body.msg_id.ok_or(Error::MissingMessageId)?,
+            in_reply_to: src.body.msg_id,
             body,
         };
 
+        let (node_id, msg_id) = tokio::join!(self.id(), self.next_msg_id());
+
         let msg = Message {
-            src: state.id.clone(),
+            src: node_id,
             dest: src.src,
             body: Body {
-                msg_id: Some(msg_id),
+                msg_id,
                 type_,
                 body: Some(serde_json::to_value(reply)?),
             },
