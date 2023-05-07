@@ -1,37 +1,24 @@
-use std::{collections::HashMap, future::Future, io::Error as IoError, pin::Pin, sync::Arc};
+use std::{any::Any, collections::HashMap, future::Future, pin::Pin, sync::Arc};
 
 use async_trait::async_trait;
 use futures::future::join_all;
-use log::trace;
+use log::{error, trace};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use thiserror::Error;
 use tokio::{
     io::{self, AsyncBufReadExt, BufReader},
-    sync::{mpsc, Mutex},
+    sync::{mpsc, oneshot, Mutex},
 };
 
-#[derive(Error, Debug)]
-pub enum Error {
-    #[error("I/O error")]
-    Io(#[from] IoError),
+mod error;
+mod seq;
 
-    #[error("JSON serialisation error")]
-    Json(#[from] serde_json::Error),
-
-    #[error("Reply channel send error")]
-    ReplySendError(#[from] mpsc::error::SendError<(Message, String, Option<JsonValue>)>),
-
-    #[error("Parse error")]
-    Parse(String),
-
-    #[error("Unknown error")]
-    Unknown,
-}
+pub use error::Error;
+pub use seq::SeqKv;
 
 #[derive(Serialize, Deserialize)]
 pub struct Reply<B> {
-    pub in_reply_to: u64,
+    pub in_reply_to: Option<u64>,
 
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub body: Option<B>,
@@ -41,7 +28,7 @@ pub struct Reply<B> {
 pub struct Body {
     #[serde(rename = "type")]
     pub type_: String,
-    pub msg_id: u64,
+    pub msg_id: Option<u64>,
 
     #[serde(flatten, skip_serializing_if = "Option::is_none")]
     pub body: Option<JsonValue>,
@@ -105,7 +92,7 @@ impl Context {
         node_id: String,
         type_: String,
         body: Option<R>,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         self.node.send_value(node_id, type_, body).await
     }
 }
@@ -155,6 +142,43 @@ async fn handle_init(ctx: Context, msg: Message) -> Result<(), Error> {
     Ok(())
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct MaelstromError {
+    pub code: i32,
+    pub text: Option<String>,
+}
+
+async fn handle_error(ctx: Context, msg: Message) -> Result<(), Error> {
+    if let Some((Some(in_reply_to), err)) = msg
+        .body
+        .parse::<Reply<MaelstromError>>()?
+        .and_then(|b| b.body.map(|err| (b.in_reply_to, err)))
+    {
+        error!(
+            "Received error message. Code: {}, Text: {:?}, Reply To: {}",
+            err.code, err.text, in_reply_to
+        );
+
+        if let Some(tx) = ctx
+            .node
+            .state
+            .lock()
+            .await
+            .error_notify
+            .remove(&in_reply_to)
+        {
+            if !tx.is_closed() {
+                tx.send(err).map_err(|_| {
+                    error!("handle_error: sending error to channel failed.");
+                    Error::ChannelSend("Sending error to notify channel failed.".to_string())
+                })?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
 #[derive(Clone)]
 pub struct Node {
     #[allow(clippy::type_complexity)]
@@ -176,8 +200,13 @@ struct State {
     id: String,
     node_ids: Vec<String>,
     msg_id_counter: usize,
+
     reply_queue_tx: mpsc::Sender<(Message, String, Option<JsonValue>)>,
     reply_queue_rx: Option<mpsc::Receiver<(Message, String, Option<JsonValue>)>>,
+
+    error_notify: HashMap<u64, oneshot::Sender<MaelstromError>>,
+
+    services: HashMap<&'static str, Box<dyn Any + Send>>,
 }
 
 impl Node {
@@ -192,12 +221,64 @@ impl Node {
                 msg_id_counter: 1,
                 reply_queue_tx,
                 reply_queue_rx: Some(reply_queue_rx),
+                error_notify: HashMap::new(),
+                services: HashMap::new(),
             })),
         };
 
+        node.add_service("seqkv", Box::new(SeqKv::new(node.clone())))
+            .await;
+
         node.handle("init", handle_init).await;
+        node.handle("error", handle_error).await;
 
         node
+    }
+
+    pub async fn add_service(&self, name: &'static str, svc: Box<dyn Any + Send>) {
+        let mut state = self.state.lock().await;
+        if let Some(e) = state.services.get_mut(name) {
+            *e = svc;
+        } else {
+            state.services.insert(name, svc);
+        }
+    }
+
+    pub fn for_service<T, F, R>(&self, name: &'static str, action: F) -> Result<R, Error>
+    where
+        T: 'static,
+        F: Fn(&T) -> Result<R, Error>,
+    {
+        self.state
+            .blocking_lock()
+            .services
+            .get(name)
+            .and_then(|svc| svc.downcast_ref::<T>())
+            .map(action)
+            .unwrap_or(Err(Error::ServiceNotFound(name)))
+    }
+
+    pub fn for_service_mut<T, F, R>(&self, name: &'static str, action: F) -> Result<R, Error>
+    where
+        T: 'static,
+        F: Fn(&mut T) -> Result<R, Error>,
+    {
+        self.state
+            .blocking_lock()
+            .services
+            .get_mut(name)
+            .and_then(|svc| svc.downcast_mut::<T>())
+            .map(action)
+            .unwrap_or(Err(Error::ServiceNotFound(name)))
+    }
+
+    pub async fn notify_error(&self, msg_id: u64, tx: oneshot::Sender<MaelstromError>) {
+        let mut state = self.state.lock().await;
+        if let Some(e) = state.error_notify.get_mut(&msg_id) {
+            *e = tx;
+        } else {
+            state.error_notify.insert(msg_id, tx);
+        }
     }
 
     pub async fn handle<T: MessageHandler + Send + 'static>(&mut self, type_: &str, handler: T) {
@@ -225,7 +306,7 @@ impl Node {
         node_id: String,
         type_: String,
         body: Option<R>,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         self.send(
             node_id,
             type_,
@@ -239,14 +320,14 @@ impl Node {
         node_id: String,
         type_: String,
         body: Option<JsonValue>,
-    ) -> Result<(), Error> {
+    ) -> Result<u64, Error> {
         let (src, msg_id) = tokio::join!(self.id(), self.next_msg_id());
 
         let msg = Message {
             src,
             dest: node_id,
             body: Body {
-                msg_id,
+                msg_id: Some(msg_id),
                 type_,
                 body,
             },
@@ -254,7 +335,7 @@ impl Node {
 
         println!("{}", serde_json::to_string(&msg)?);
 
-        Ok(())
+        Ok(msg_id)
     }
 
     pub async fn reply_to(
@@ -274,7 +355,7 @@ impl Node {
             src: node_id,
             dest: src.src,
             body: Body {
-                msg_id,
+                msg_id: Some(msg_id),
                 type_,
                 body: Some(serde_json::to_value(reply)?),
             },
