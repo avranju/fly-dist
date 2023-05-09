@@ -1,12 +1,18 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
 use futures::Future;
 use log::error;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value as JsonValue;
-use tokio::sync::{oneshot, Mutex, MutexGuard};
+use tokio::{
+    sync::{oneshot, Mutex, MutexGuard},
+    time,
+};
 
 use crate::{Context, Error, Message, Node, Reply, Service};
+
+/// Amount of time we'll wait before giving up on a call to the seq-kv service.
+const CALL_TIMEOUT_MS: u64 = 400;
 
 struct State {
     node: Node,
@@ -68,17 +74,23 @@ impl SeqKv {
             .notify_error(msg_id, error_tx)
             .await;
 
-        //TODO: Also select on a timeout future below.
+        let timeout = time::sleep(Duration::from_millis(CALL_TIMEOUT_MS));
 
-        // race on the 2 futures and see what we get first
+        // race on the 3 futures and see what we get first
         tokio::select! {
             val = result_rx => {
                 Ok(val
                     .map_err(|err| Error::ChannelRecv(format!("{:?}", err)))
                     .and_then(|val| serde_json::from_value(val).map_err(Error::Json))?)
             },
+
             Ok(err) = error_rx => {
                 Err(err.into())
+            },
+
+            _ = timeout => {
+                error!("'read' on seq-kv service timed out.");
+                Err(Error::Timeout("'read' on seq-kv service timed out.".into()))
             }
         }
     }
@@ -110,7 +122,9 @@ impl SeqKv {
                 to,
                 create_if_not_exists,
             },
-            |mut this, msg_id, tx| async move { this.notify_cas(msg_id, tx).await },
+            |mut this, msg_id, tx| async move {
+                this.notify_cas(msg_id, tx).await;
+            },
         )
         .await
         .map_err(|err| match &err {
@@ -124,26 +138,29 @@ impl SeqKv {
     }
 
     async fn notify_read(&mut self, msg_id: u64, tx: oneshot::Sender<JsonValue>) {
-        if let Some(e) = self.state.lock().await.read_notify.get_mut(&msg_id) {
+        let mut state = self.state.lock().await;
+        if let Some(e) = state.read_notify.get_mut(&msg_id) {
             *e = tx;
         } else {
-            self.state.lock().await.read_notify.insert(msg_id, tx);
+            state.read_notify.insert(msg_id, tx);
         }
     }
 
     async fn notify_write(&mut self, msg_id: u64, tx: oneshot::Sender<()>) {
-        if let Some(e) = self.state.lock().await.write_notify.get_mut(&msg_id) {
+        let mut state = self.state.lock().await;
+        if let Some(e) = state.write_notify.get_mut(&msg_id) {
             *e = tx;
         } else {
-            self.state.lock().await.write_notify.insert(msg_id, tx);
+            state.write_notify.insert(msg_id, tx);
         }
     }
 
     async fn notify_cas(&mut self, msg_id: u64, tx: oneshot::Sender<()>) {
-        if let Some(e) = self.state.lock().await.cas_notify.get_mut(&msg_id) {
+        let mut state = self.state.lock().await;
+        if let Some(e) = state.cas_notify.get_mut(&msg_id) {
             *e = tx;
         } else {
-            self.state.lock().await.cas_notify.insert(msg_id, tx);
+            state.cas_notify.insert(msg_id, tx);
         }
     }
 
@@ -159,13 +176,14 @@ impl SeqKv {
         F: Fn(SeqKv, u64, oneshot::Sender<()>) -> U,
     {
         // send out the cas/write request
-        let msg_id = self
-            .state
-            .lock()
-            .await
-            .node
-            .send_value(SeqKv::name(), op_name.to_string(), Some(body))
-            .await?;
+        let msg_id = {
+            self.state
+                .lock()
+                .await
+                .node
+                .send_value(SeqKv::name(), op_name.to_string(), Some(body))
+                .await?
+        };
 
         let (error_tx, error_rx) = oneshot::channel();
         let (result_tx, result_rx) = oneshot::channel();
@@ -179,16 +197,22 @@ impl SeqKv {
             .notify_error(msg_id, error_tx)
             .await;
 
-        //TODO: Also select on a timeout future below.
+        let timeout = time::sleep(Duration::from_millis(CALL_TIMEOUT_MS));
 
-        // race on the 2 futures and see what we get first
+        // race on the 3 futures and see what we get first
         tokio::select! {
             val = result_rx => {
                 Ok(val
                     .map_err(|err| Error::ChannelRecv(format!("{:?}", err)))?)
             },
+
             Ok(err) = error_rx => {
                 Err(err.into())
+            },
+
+            _ = timeout => {
+                error!("'{op_name}' on seq-kv service timed out.");
+                Err(Error::Timeout(format!("'{op_name}' on seq-kv service timed out.")))
             }
         }
     }

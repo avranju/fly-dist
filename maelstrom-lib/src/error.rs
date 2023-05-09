@@ -38,6 +38,9 @@ pub enum Error {
     #[error("K/V service: Cas op failed because 'from' value did not match")]
     KvCasMismatch,
 
+    #[error("Call timed out - {0}.")]
+    Timeout(String),
+
     #[error("Unknown error")]
     Unknown,
 }

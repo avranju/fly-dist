@@ -1,7 +1,6 @@
-use std::{any::Any, collections::HashMap, future::Future, pin::Pin, sync::Arc};
+use std::{any::Any, collections::HashMap, fmt::Debug, future::Future, pin::Pin, sync::Arc};
 
 use async_trait::async_trait;
-use futures::future::join_all;
 use log::{error, trace};
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value as JsonValue;
@@ -56,6 +55,14 @@ pub struct Context {
     node_id: String,
     node: Node,
     reply_queue_tx: mpsc::Sender<(Message, String, Option<JsonValue>)>,
+}
+
+impl Debug for Context {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Context")
+            .field("node_id", &self.node_id)
+            .finish()
+    }
 }
 
 impl Context {
@@ -190,7 +197,7 @@ async fn handle_error(ctx: Context, msg: Message) -> Result<(), Error> {
 #[derive(Clone)]
 pub struct Node {
     #[allow(clippy::type_complexity)]
-    handlers: Arc<Mutex<HashMap<String, Vec<Box<dyn MessageHandler + Send>>>>>,
+    handlers: Arc<Mutex<HashMap<String, Vec<Arc<Mutex<Box<dyn MessageHandler + Send + Sync>>>>>>>,
     state: Arc<Mutex<State>>,
 }
 
@@ -287,14 +294,18 @@ impl Node {
         }
     }
 
-    pub async fn handle<T: MessageHandler + Send + 'static>(&mut self, type_: &str, handler: T) {
+    pub async fn handle<T: MessageHandler + Send + Sync + 'static>(
+        &mut self,
+        type_: &str,
+        handler: T,
+    ) {
         let handler = Box::new(handler);
         let handlers = &mut self.handlers.lock().await;
 
         if let Some(handlers) = handlers.get_mut(type_) {
-            handlers.push(handler);
+            handlers.push(Arc::new(Mutex::new(handler)));
         } else {
-            handlers.insert(type_.to_string(), vec![handler]);
+            handlers.insert(type_.to_string(), vec![Arc::new(Mutex::new(handler))]);
         }
     }
 
@@ -407,12 +418,36 @@ impl Node {
                 },
 
                 Ok(Some(line)) = lines.next_line() => {
+                    trace!("Processing line: {line}");
                     let msg: Message = serde_json::from_str(&line)?;
-                    if let Some(handlers) = self.handlers.lock().await.get(&msg.body.type_) {
-                        let _ = join_all(handlers.iter().map(|h| h.handle(ctx.clone(), msg.clone()))).await;
-                    }
+                    tokio::spawn(process_line(self.clone(), ctx.clone(), msg));
                 },
             }
         }
+    }
+}
+
+async fn process_line(node: Node, ctx: Context, msg: Message) {
+    let handlers = { node.handlers.lock().await.get(&msg.body.type_).cloned() };
+    if let Some(handlers) = handlers {
+        for handler in handlers.into_iter() {
+            if let Err(err) = handler.lock().await.handle(ctx.clone(), msg.clone()).await {
+                let _ = node
+                    .send_value(
+                        msg.src.clone(),
+                        "error".to_string(),
+                        Some(MaelstromError {
+                            code: 1001,
+                            text: Some(format!("{:?}", err)),
+                        }),
+                    )
+                    .await;
+            }
+        }
+    } else {
+        trace!(
+            "process_lines: Did not find a handler for message type: {}",
+            msg.body.type_
+        );
     }
 }
