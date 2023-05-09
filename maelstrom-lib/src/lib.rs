@@ -234,7 +234,7 @@ impl Node {
             })),
         };
 
-        node.add_service(SeqKv::new(node.clone()).await);
+        node.add_service(SeqKv::new(node.clone()).await).await;
 
         node.handle("init", handle_init).await;
         node.handle("error", handle_error).await;
@@ -242,12 +242,12 @@ impl Node {
         node
     }
 
-    pub fn add_service<T>(&self, svc: T)
+    pub async fn add_service<T>(&self, svc: T)
     where
         T: Service + Send + 'static,
     {
         let svc: Box<dyn Any + Send> = Box::new(svc);
-        let mut state = self.state.blocking_lock();
+        let mut state = self.state.lock().await;
         if let Some(e) = state.services.get_mut(T::NAME) {
             *e = svc;
         } else {
@@ -255,13 +255,14 @@ impl Node {
         }
     }
 
-    pub fn for_service<T, F, R>(&self, action: F) -> Result<R, Error>
+    pub async fn for_service<T, F, R>(&self, action: F) -> Result<R, Error>
     where
         T: Service + 'static,
         F: Fn(&T) -> Result<R, Error>,
     {
         self.state
-            .blocking_lock()
+            .lock()
+            .await
             .services
             .get(T::NAME)
             .and_then(|svc| svc.downcast_ref::<T>())
@@ -269,13 +270,14 @@ impl Node {
             .unwrap_or(Err(Error::ServiceNotFound(T::NAME)))
     }
 
-    pub fn for_service_mut<T, F, R>(&self, action: F) -> Result<R, Error>
+    pub async fn for_service_mut<T, F, R>(&self, action: F) -> Result<R, Error>
     where
         T: Service + 'static,
         F: Fn(&mut T) -> Result<R, Error>,
     {
         self.state
-            .blocking_lock()
+            .lock()
+            .await
             .services
             .get_mut(T::NAME)
             .and_then(|svc| svc.downcast_mut::<T>())

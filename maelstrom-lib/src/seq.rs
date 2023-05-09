@@ -170,31 +170,33 @@ async fn handle_read_ok(ctx: Context, msg: Message) -> Result<(), Error> {
         .parse::<Reply<ReadOk>>()?
         .and_then(|b| b.body.map(|read_ok| (b.in_reply_to, read_ok)))
     {
-        ctx.node.for_service_mut(|svc: &mut SeqKv| {
-            svc.read_notify
-                .remove(&in_reply_to)
-                .map(|tx| {
-                    if !tx.is_closed() {
-                        tx.send(read_ok.value.clone()).map_err(|_| {
-                            error!("handle_read_ok: sending read result to channel failed");
-                            Error::ChannelSend(
-                                "Sending read result to SeqKv channel failed.".to_string(),
-                            )
-                        })
-                    } else {
-                        Ok(())
-                    }
-                })
-                // if we don't find a message id that's waiting for a response in
-                // read_notify, we just drop the read_ok message
-                .unwrap_or(Ok(()))
-        })
+        ctx.node
+            .for_service_mut(|svc: &mut SeqKv| {
+                svc.read_notify
+                    .remove(&in_reply_to)
+                    .map(|tx| {
+                        if !tx.is_closed() {
+                            tx.send(read_ok.value.clone()).map_err(|_| {
+                                error!("handle_read_ok: sending read result to channel failed");
+                                Error::ChannelSend(
+                                    "Sending read result to SeqKv channel failed.".to_string(),
+                                )
+                            })
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    // if we don't find a message id that's waiting for a response in
+                    // read_notify, we just drop the read_ok message
+                    .unwrap_or(Ok(()))
+            })
+            .await
     } else {
         Ok(())
     }
 }
 
-fn handle_mut_op_ok<F>(
+async fn handle_mut_op_ok<F>(
     ctx: Context,
     msg: Message,
     map_get: F,
@@ -204,27 +206,29 @@ where
     F: Fn(&mut SeqKv) -> &mut HashMap<u64, oneshot::Sender<()>>,
 {
     if let Some(in_reply_to) = msg.body.parse::<Reply<()>>()?.and_then(|b| b.in_reply_to) {
-        ctx.node.for_service_mut(|svc: &mut SeqKv| {
-            map_get(svc)
-                .remove(&in_reply_to)
-                .map(|tx| {
-                    if !tx.is_closed() {
-                        tx.send(()).map_err(|_| {
-                            error!(
+        ctx.node
+            .for_service_mut(|svc: &mut SeqKv| {
+                map_get(svc)
+                    .remove(&in_reply_to)
+                    .map(|tx| {
+                        if !tx.is_closed() {
+                            tx.send(()).map_err(|_| {
+                                error!(
                                 "handle_{op_name}_ok: sending {op_name} result to channel failed"
                             );
-                            Error::ChannelSend(format!(
-                                "Sending {op_name} result to SeqKv channel failed."
-                            ))
-                        })
-                    } else {
-                        Ok(())
-                    }
-                })
-                // if we don't find a message id that's waiting for a response in
-                // read_notify/cas_notify, we just drop the *_ok message
-                .unwrap_or(Ok(()))
-        })
+                                Error::ChannelSend(format!(
+                                    "Sending {op_name} result to SeqKv channel failed."
+                                ))
+                            })
+                        } else {
+                            Ok(())
+                        }
+                    })
+                    // if we don't find a message id that's waiting for a response in
+                    // read_notify/cas_notify, we just drop the *_ok message
+                    .unwrap_or(Ok(()))
+            })
+            .await
     } else {
         Ok(())
     }
@@ -237,7 +241,7 @@ struct Write<T: Serialize> {
 }
 
 async fn handle_write_ok(ctx: Context, msg: Message) -> Result<(), Error> {
-    handle_mut_op_ok(ctx, msg, |svc| &mut svc.write_notify, "write")
+    handle_mut_op_ok(ctx, msg, |svc| &mut svc.write_notify, "write").await
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -248,5 +252,5 @@ struct Cas<T: Serialize> {
 }
 
 async fn handle_cas_ok(ctx: Context, msg: Message) -> Result<(), Error> {
-    handle_mut_op_ok(ctx, msg, |svc| &mut svc.cas_notify, "cas")
+    handle_mut_op_ok(ctx, msg, |svc| &mut svc.cas_notify, "cas").await
 }
