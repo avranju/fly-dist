@@ -255,34 +255,27 @@ impl Node {
         }
     }
 
-    pub async fn for_service<T, F, R>(&self, action: F) -> Result<R, Error>
+    pub async fn for_service<T, F, R, U>(&self, action: F) -> Result<R, Error>
     where
-        T: Service + 'static,
-        F: Fn(&T) -> Result<R, Error>,
+        T: Service + Clone + 'static,
+        U: Future<Output = Result<R, Error>>,
+        F: FnOnce(T) -> U,
     {
-        self.state
-            .lock()
-            .await
-            .services
-            .get(T::NAME)
-            .and_then(|svc| svc.downcast_ref::<T>())
-            .map(action)
-            .unwrap_or(Err(Error::ServiceNotFound(T::NAME)))
-    }
+        let v = {
+            self.state
+                .lock()
+                .await
+                .services
+                .get(T::NAME)
+                .and_then(|svc| svc.downcast_ref::<T>())
+                .cloned()
+        };
 
-    pub async fn for_service_mut<T, F, R>(&self, action: F) -> Result<R, Error>
-    where
-        T: Service + 'static,
-        F: Fn(&mut T) -> Result<R, Error>,
-    {
-        self.state
-            .lock()
-            .await
-            .services
-            .get_mut(T::NAME)
-            .and_then(|svc| svc.downcast_mut::<T>())
-            .map(action)
-            .unwrap_or(Err(Error::ServiceNotFound(T::NAME)))
+        if let Some(fut) = v.map(action) {
+            fut.await
+        } else {
+            Err(Error::ServiceNotFound(T::NAME))
+        }
     }
 
     pub async fn notify_error(&self, msg_id: u64, tx: oneshot::Sender<MaelstromError>) {

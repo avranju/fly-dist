@@ -32,6 +32,12 @@ pub enum Error {
     #[error("Service {0} was not found on the node")]
     ServiceNotFound(&'static str),
 
+    #[error("K/V service: Key {0} was not found")]
+    KvKeyNotFound(String),
+
+    #[error("K/V service: Cas op failed because 'from' value did not match")]
+    KvCasMismatch,
+
     #[error("Unknown error")]
     Unknown,
 }
