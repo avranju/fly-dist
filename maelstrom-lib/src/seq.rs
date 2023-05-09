@@ -5,13 +5,17 @@ use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::Value as JsonValue;
 use tokio::sync::oneshot;
 
-use crate::{Context, Error, Message, Node, Reply};
+use crate::{Context, Error, Message, Node, Reply, Service};
 
 pub struct SeqKv {
     node: Node,
     read_notify: HashMap<u64, oneshot::Sender<JsonValue>>,
     write_notify: HashMap<u64, oneshot::Sender<()>>,
     cas_notify: HashMap<u64, oneshot::Sender<()>>,
+}
+
+impl Service for SeqKv {
+    const NAME: &'static str = "seq-kv";
 }
 
 impl SeqKv {
@@ -57,7 +61,7 @@ impl SeqKv {
         let msg_id = self
             .node
             .send_value(
-                "seq-kv".to_string(),
+                SeqKv::name(),
                 "read".to_string(),
                 Some(Read {
                     key: key.to_string(),
@@ -92,7 +96,7 @@ impl SeqKv {
         let msg_id = self
             .node
             .send_value(
-                "seq-kv".to_string(),
+                SeqKv::name(),
                 "write".to_string(),
                 Some(Write {
                     key: key.to_string(),
@@ -127,7 +131,7 @@ impl SeqKv {
         let msg_id = self
             .node
             .send_value(
-                "seq-kv".to_string(),
+                SeqKv::name(),
                 "cas".to_string(),
                 Some(Cas {
                     key: key.to_string(),
@@ -175,7 +179,7 @@ async fn handle_read_ok(ctx: Context, msg: Message) -> Result<(), Error> {
         .parse::<Reply<ReadOk>>()?
         .and_then(|b| b.body.map(|read_ok| (b.in_reply_to, read_ok)))
     {
-        ctx.node.for_service_mut::<SeqKv, _, ()>("seqkv", |svc| {
+        ctx.node.for_service_mut::<SeqKv, _, ()>(|svc| {
             svc.read_notify
                 .remove(&in_reply_to)
                 .map(|tx| {
@@ -207,7 +211,7 @@ struct Write<T: Serialize> {
 
 async fn handle_write_ok(ctx: Context, msg: Message) -> Result<(), Error> {
     if let Some(in_reply_to) = msg.body.parse::<Reply<()>>()?.and_then(|b| b.in_reply_to) {
-        ctx.node.for_service_mut::<SeqKv, _, ()>("seqkv", |svc| {
+        ctx.node.for_service_mut::<SeqKv, _, ()>(|svc| {
             svc.write_notify
                 .remove(&in_reply_to)
                 .map(|tx| {
@@ -240,7 +244,7 @@ struct Cas<T: Serialize> {
 
 async fn handle_cas_ok(ctx: Context, msg: Message) -> Result<(), Error> {
     if let Some(in_reply_to) = msg.body.parse::<Reply<()>>()?.and_then(|b| b.in_reply_to) {
-        ctx.node.for_service_mut::<SeqKv, _, ()>("seqkv", |svc| {
+        ctx.node.for_service_mut::<SeqKv, _, ()>(|svc| {
             svc.cas_notify
                 .remove(&in_reply_to)
                 .map(|tx| {

@@ -97,6 +97,14 @@ impl Context {
     }
 }
 
+pub trait Service {
+    const NAME: &'static str;
+
+    fn name() -> String {
+        Self::NAME.to_string()
+    }
+}
+
 #[async_trait]
 pub trait MessageHandler {
     async fn handle(&self, ctx: Context, msg: Message) -> Result<(), Error>;
@@ -226,8 +234,7 @@ impl Node {
             })),
         };
 
-        node.add_service("seqkv", Box::new(SeqKv::new(node.clone())))
-            .await;
+        node.add_service(SeqKv::new(node.clone()).await);
 
         node.handle("init", handle_init).await;
         node.handle("error", handle_error).await;
@@ -235,41 +242,45 @@ impl Node {
         node
     }
 
-    pub async fn add_service(&self, name: &'static str, svc: Box<dyn Any + Send>) {
-        let mut state = self.state.lock().await;
-        if let Some(e) = state.services.get_mut(name) {
+    pub fn add_service<T>(&self, svc: T)
+    where
+        T: Service + Send + 'static,
+    {
+        let svc: Box<dyn Any + Send> = Box::new(svc);
+        let mut state = self.state.blocking_lock();
+        if let Some(e) = state.services.get_mut(T::NAME) {
             *e = svc;
         } else {
-            state.services.insert(name, svc);
+            state.services.insert(T::NAME, svc);
         }
     }
 
-    pub fn for_service<T, F, R>(&self, name: &'static str, action: F) -> Result<R, Error>
+    pub fn for_service<T, F, R>(&self, action: F) -> Result<R, Error>
     where
-        T: 'static,
+        T: Service + 'static,
         F: Fn(&T) -> Result<R, Error>,
     {
         self.state
             .blocking_lock()
             .services
-            .get(name)
+            .get(T::NAME)
             .and_then(|svc| svc.downcast_ref::<T>())
             .map(action)
-            .unwrap_or(Err(Error::ServiceNotFound(name)))
+            .unwrap_or(Err(Error::ServiceNotFound(T::NAME)))
     }
 
-    pub fn for_service_mut<T, F, R>(&self, name: &'static str, action: F) -> Result<R, Error>
+    pub fn for_service_mut<T, F, R>(&self, action: F) -> Result<R, Error>
     where
-        T: 'static,
+        T: Service + 'static,
         F: Fn(&mut T) -> Result<R, Error>,
     {
         self.state
             .blocking_lock()
             .services
-            .get_mut(name)
+            .get_mut(T::NAME)
             .and_then(|svc| svc.downcast_mut::<T>())
             .map(action)
-            .unwrap_or(Err(Error::ServiceNotFound(name)))
+            .unwrap_or(Err(Error::ServiceNotFound(T::NAME)))
     }
 
     pub async fn notify_error(&self, msg_id: u64, tx: oneshot::Sender<MaelstromError>) {
