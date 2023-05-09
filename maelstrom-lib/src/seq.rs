@@ -91,25 +91,27 @@ impl SeqKv {
         }
     }
 
-    pub async fn write<T: Serialize>(&mut self, key: &str, value: T) -> Result<(), Error> {
-        // send out the write key/value request
+    async fn mut_op<T, F>(
+        &mut self,
+        op_name: &'static str,
+        body: T,
+        notifier: F,
+    ) -> Result<(), Error>
+    where
+        T: Serialize,
+        F: Fn(&mut SeqKv, u64, oneshot::Sender<()>),
+    {
+        // send out the cas/write request
         let msg_id = self
             .node
-            .send_value(
-                SeqKv::name(),
-                "write".to_string(),
-                Some(Write {
-                    key: key.to_string(),
-                    value,
-                }),
-            )
+            .send_value(SeqKv::name(), op_name.to_string(), Some(body))
             .await?;
 
         let (error_tx, error_rx) = oneshot::channel();
         let (result_tx, result_rx) = oneshot::channel();
 
         // register to be notified of error/result
-        self.notify_write(msg_id, result_tx);
+        notifier(self, msg_id, result_tx);
         self.node.notify_error(msg_id, error_tx).await;
 
         //TODO: Also select on a timeout future below.
@@ -126,40 +128,29 @@ impl SeqKv {
         }
     }
 
-    pub async fn cas<T: Serialize>(&mut self, key: &str, from: T, to: T) -> Result<(), Error> {
-        // send out the cas request
-        let msg_id = self
-            .node
-            .send_value(
-                SeqKv::name(),
-                "cas".to_string(),
-                Some(Cas {
-                    key: key.to_string(),
-                    from,
-                    to,
-                }),
-            )
-            .await?;
-
-        let (error_tx, error_rx) = oneshot::channel();
-        let (result_tx, result_rx) = oneshot::channel();
-
-        // register to be notified of error/result
-        self.notify_cas(msg_id, result_tx);
-        self.node.notify_error(msg_id, error_tx).await;
-
-        //TODO: Also select on a timeout future below.
-
-        // race on the 2 futures and see what we get first
-        tokio::select! {
-            val = result_rx => {
-                Ok(val
-                    .map_err(|err| Error::ChannelRecv(format!("{:?}", err)))?)
+    pub async fn write<T: Serialize>(&mut self, key: &str, value: T) -> Result<(), Error> {
+        self.mut_op(
+            "write",
+            Write {
+                key: key.to_string(),
+                value,
             },
-            Ok(err) = error_rx => {
-                Err(err.into())
-            }
-        }
+            |this, msg_id, tx| this.notify_write(msg_id, tx),
+        )
+        .await
+    }
+
+    pub async fn cas<T: Serialize>(&mut self, key: &str, from: T, to: T) -> Result<(), Error> {
+        self.mut_op(
+            "cas",
+            Cas {
+                key: key.to_string(),
+                from,
+                to,
+            },
+            |this, msg_id, tx| this.notify_cas(msg_id, tx),
+        )
+        .await
     }
 }
 
@@ -179,7 +170,7 @@ async fn handle_read_ok(ctx: Context, msg: Message) -> Result<(), Error> {
         .parse::<Reply<ReadOk>>()?
         .and_then(|b| b.body.map(|read_ok| (b.in_reply_to, read_ok)))
     {
-        ctx.node.for_service_mut::<SeqKv, _, ()>(|svc| {
+        ctx.node.for_service_mut(|svc: &mut SeqKv| {
             svc.read_notify
                 .remove(&in_reply_to)
                 .map(|tx| {
@@ -203,7 +194,7 @@ async fn handle_read_ok(ctx: Context, msg: Message) -> Result<(), Error> {
     }
 }
 
-async fn handle_mut_op_ok<F>(
+fn handle_mut_op_ok<F>(
     ctx: Context,
     msg: Message,
     map_get: F,
@@ -213,7 +204,7 @@ where
     F: Fn(&mut SeqKv) -> &mut HashMap<u64, oneshot::Sender<()>>,
 {
     if let Some(in_reply_to) = msg.body.parse::<Reply<()>>()?.and_then(|b| b.in_reply_to) {
-        ctx.node.for_service_mut::<SeqKv, _, ()>(|svc| {
+        ctx.node.for_service_mut(|svc: &mut SeqKv| {
             map_get(svc)
                 .remove(&in_reply_to)
                 .map(|tx| {
@@ -246,7 +237,7 @@ struct Write<T: Serialize> {
 }
 
 async fn handle_write_ok(ctx: Context, msg: Message) -> Result<(), Error> {
-    handle_mut_op_ok(ctx, msg, |svc| &mut svc.write_notify, "write").await
+    handle_mut_op_ok(ctx, msg, |svc| &mut svc.write_notify, "write")
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -257,5 +248,5 @@ struct Cas<T: Serialize> {
 }
 
 async fn handle_cas_ok(ctx: Context, msg: Message) -> Result<(), Error> {
-    handle_mut_op_ok(ctx, msg, |svc| &mut svc.cas_notify, "cas").await
+    handle_mut_op_ok(ctx, msg, |svc| &mut svc.cas_notify, "cas")
 }
