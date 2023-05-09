@@ -203,6 +203,42 @@ async fn handle_read_ok(ctx: Context, msg: Message) -> Result<(), Error> {
     }
 }
 
+async fn handle_mut_op_ok<F>(
+    ctx: Context,
+    msg: Message,
+    map_get: F,
+    op_name: &'static str,
+) -> Result<(), Error>
+where
+    F: Fn(&mut SeqKv) -> &mut HashMap<u64, oneshot::Sender<()>>,
+{
+    if let Some(in_reply_to) = msg.body.parse::<Reply<()>>()?.and_then(|b| b.in_reply_to) {
+        ctx.node.for_service_mut::<SeqKv, _, ()>(|svc| {
+            map_get(svc)
+                .remove(&in_reply_to)
+                .map(|tx| {
+                    if !tx.is_closed() {
+                        tx.send(()).map_err(|_| {
+                            error!(
+                                "handle_{op_name}_ok: sending {op_name} result to channel failed"
+                            );
+                            Error::ChannelSend(format!(
+                                "Sending {op_name} result to SeqKv channel failed."
+                            ))
+                        })
+                    } else {
+                        Ok(())
+                    }
+                })
+                // if we don't find a message id that's waiting for a response in
+                // read_notify/cas_notify, we just drop the *_ok message
+                .unwrap_or(Ok(()))
+        })
+    } else {
+        Ok(())
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct Write<T: Serialize> {
     key: String,
@@ -210,29 +246,7 @@ struct Write<T: Serialize> {
 }
 
 async fn handle_write_ok(ctx: Context, msg: Message) -> Result<(), Error> {
-    if let Some(in_reply_to) = msg.body.parse::<Reply<()>>()?.and_then(|b| b.in_reply_to) {
-        ctx.node.for_service_mut::<SeqKv, _, ()>(|svc| {
-            svc.write_notify
-                .remove(&in_reply_to)
-                .map(|tx| {
-                    if !tx.is_closed() {
-                        tx.send(()).map_err(|_| {
-                            error!("handle_write_ok: sending write result to channel failed");
-                            Error::ChannelSend(
-                                "Sending write result to SeqKv channel failed.".to_string(),
-                            )
-                        })
-                    } else {
-                        Ok(())
-                    }
-                })
-                // if we don't find a message id that's waiting for a response in
-                // read_notify, we just drop the read_ok message
-                .unwrap_or(Ok(()))
-        })
-    } else {
-        Ok(())
-    }
+    handle_mut_op_ok(ctx, msg, |svc| &mut svc.write_notify, "write").await
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -243,27 +257,5 @@ struct Cas<T: Serialize> {
 }
 
 async fn handle_cas_ok(ctx: Context, msg: Message) -> Result<(), Error> {
-    if let Some(in_reply_to) = msg.body.parse::<Reply<()>>()?.and_then(|b| b.in_reply_to) {
-        ctx.node.for_service_mut::<SeqKv, _, ()>(|svc| {
-            svc.cas_notify
-                .remove(&in_reply_to)
-                .map(|tx| {
-                    if !tx.is_closed() {
-                        tx.send(()).map_err(|_| {
-                            error!("handle_cas_ok: sending cas result to channel failed");
-                            Error::ChannelSend(
-                                "Sending cas result to SeqKv channel failed.".to_string(),
-                            )
-                        })
-                    } else {
-                        Ok(())
-                    }
-                })
-                // if we don't find a message id that's waiting for a response in
-                // read_notify, we just drop the read_ok message
-                .unwrap_or(Ok(()))
-        })
-    } else {
-        Ok(())
-    }
+    handle_mut_op_ok(ctx, msg, |svc| &mut svc.cas_notify, "cas").await
 }
