@@ -1,8 +1,9 @@
 [workspace]
 members = [
-  "maelstrom-lib",
-  "echo",
-  "uniqueid",
   "broadcast",
+  "echo",
   "gcounter",
+  "kafka",
+  "maelstrom-lib",
+  "uniqueid",
 ]
