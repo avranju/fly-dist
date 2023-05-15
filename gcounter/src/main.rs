@@ -1,9 +1,14 @@
 use std::time::Instant;
 
 #[cfg(feature = "seqkv")]
+#[cfg(feature = "seqkv")]
 use std::sync::atomic::{AtomicI64, Ordering};
 
 use anyhow::Result;
+
+#[cfg(feature = "seqkv")]
+use async_recursion::async_recursion;
+
 use log::trace;
 use maelstrom_lib::{Context, Error, Message, Node};
 
@@ -19,7 +24,6 @@ use tokio::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
 
-#[cfg(any(feature = "seqkv", feature = "redis"))]
 const COUNTER_KEY: &str = "gcounter";
 
 #[cfg(feature = "seqkv")]
@@ -97,6 +101,7 @@ async fn main() -> Result<()> {
     builder.target(env_logger::Target::Stderr).init();
 
     let mut node = Node::new().await;
+
     node.handle("add", handle_add).await;
     node.handle("read", handle_read).await;
 
@@ -110,6 +115,32 @@ struct Add {
     delta: i64,
 }
 
+#[cfg(feature = "seqkv")]
+#[async_recursion]
+async fn do_add(
+    mut seqkv: SeqKv,
+    mut counter: i64,
+    delta: i64,
+    ctx: Context,
+    msg: Message,
+) -> Result<(), Error> {
+    match seqkv.cas(COUNTER_KEY, counter, counter + delta, true).await {
+        Ok(_) => {
+            state().add(delta);
+            ctx.reply_to(msg, "add_ok".to_string()).await?;
+            Ok(())
+        }
+        Err(Error::KvCasMismatch) => {
+            counter = seqkv.read(COUNTER_KEY).await?;
+            state().set(counter);
+
+            // retry the add request by sending it to ourselves
+            Ok(do_add(seqkv, counter, delta, ctx, msg).await?)
+        }
+        Err(err) => Err(err),
+    }
+}
+
 async fn handle_add(ctx: Context, msg: Message) -> Result<(), Error> {
     let _trace = TraceCallTime::new(format!("[{}] handle_add", msg.body.msg_id.unwrap_or(0)));
 
@@ -117,24 +148,11 @@ async fn handle_add(ctx: Context, msg: Message) -> Result<(), Error> {
         #[cfg(feature = "seqkv")]
         {
             let node = ctx.node().clone();
-            node.for_service(move |mut seqkv: SeqKv| async move {
+            node.for_service(move |seqkv: SeqKv| async move {
                 let counter = state().load();
 
-                match seqkv
-                    .cas(COUNTER_KEY, counter, counter + add.delta, true)
-                    .await
-                {
-                    Ok(_) => {
-                        state().add(add.delta);
-                        ctx.reply_to(msg, "add_ok".to_string()).await?;
-                        Ok(())
-                    }
-                    Err(Error::KvCasMismatch) => {
-                        state().set(seqkv.read(COUNTER_KEY).await?);
-                        Err(Error::KvCasMismatch)
-                    }
-                    Err(err) => Err(err),
-                }
+                trace!("handle_add: counter = {}, delta = {}", counter, add.delta);
+                do_add(seqkv, counter, add.delta, ctx, msg).await
             })
             .await?;
         }
@@ -143,10 +161,15 @@ async fn handle_add(ctx: Context, msg: Message) -> Result<(), Error> {
         {
             let mut redis = redis().lock().await;
             let connection = redis.connection().await;
-            let _: i64 = connection
+            let counter: i64 = connection
                 .incr(COUNTER_KEY, add.delta)
                 .await
                 .expect("Could not increment counter in redis");
+            trace!(
+                "handle_add: counter = {}, delta = {}",
+                counter - add.delta,
+                add.delta
+            );
             ctx.reply_to(msg, "add_ok".to_string()).await?;
         }
     }

@@ -12,6 +12,7 @@ redis = ["dep:redis", "dep:once_cell"]
 
 [dependencies]
 anyhow = "1.0.71"
+async-recursion = "1.0.4"
 env_logger = "0.10.0"
 log = "0.4.17"
 maelstrom-lib = { version = "0.1.0", path = "../maelstrom-lib" }
